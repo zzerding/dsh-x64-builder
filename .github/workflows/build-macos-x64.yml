@@ -1,0 +1,146 @@
+name: Build macOS x64 desktop (unsigned)
+
+# Upstream ships an official Intel channel, but its fixed dmg lags the Apple Silicon
+# build by weeks. This workflow rebuilds the newest upstream dsh-v* tag on a
+# GitHub-hosted Intel runner and publishes the unsigned DMG as a release asset.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build; blank builds the newest dsh-v* tag'
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-x64
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      DSH_DESKTOP_TARGET_PLATFORM: darwin
+      DSH_DESKTOP_TARGET_ARCH: x64
+      DSH_DESKTOP_PACKAGE_CACHE_DIR: ${{ runner.tool_cache }}/dsh-desktop-package-cache
+      PNPM_CONFIG_STORE_DIR: ${{ runner.tool_cache }}/dsh-desktop-package-cache/workspace-pnpm-store
+    steps:
+      - name: Select upstream tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED:-}" ]]; then
+            tag="$REQUESTED"
+          else
+            tags=$(gh api --paginate "repos/deepseek-ai/deepseek-harness/git/matching-refs/tags/dsh-v" \
+              --jq '.[]?.ref' | sed 's#refs/tags/##' | sort -u)
+            tag=$(printf '%s\n' "$tags" | node -e '
+          let input = "";
+          process.stdin.on("data", chunk => { input += chunk }).on("end", () => {
+            const parse = value => {
+              const match = /^dsh-v(.+)$/u.exec(value);
+              if (!match) return null;
+              const [core, prerelease] = match[1].split("-");
+              return { value, core: core.split(".").map(Number), prerelease: prerelease ? prerelease.split(".") : [] };
+            };
+            const compare = (a, b) => {
+              for (let index = 0; index < Math.max(a.core.length, b.core.length); index += 1) {
+                const left = a.core[index] ?? 0, right = b.core[index] ?? 0;
+                if (left !== right) return left - right;
+              }
+              if (!a.prerelease.length || !b.prerelease.length) {
+                return a.prerelease.length ? -1 : b.prerelease.length ? 1 : 0;
+              }
+              for (let index = 0; index < Math.max(a.prerelease.length, b.prerelease.length); index += 1) {
+                const left = a.prerelease[index], right = b.prerelease[index];
+                if (left === undefined) return -1;
+                if (right === undefined) return 1;
+                const numericLeft = /^\d+$/u.test(left), numericRight = /^\d+$/u.test(right);
+                if (numericLeft && numericRight && Number(left) !== Number(right)) return Number(left) - Number(right);
+                if (numericLeft !== numericRight) return numericLeft ? -1 : 1;
+                if (left !== right) return left < right ? -1 : 1;
+              }
+              return 0;
+            };
+            const selected = input.split("\n").map(line => line.trim()).filter(Boolean).map(parse).filter(Boolean).sort(compare).at(-1);
+            if (!selected) throw new Error("No dsh-v* tag found upstream");
+            process.stdout.write(selected.value);
+          });')
+          fi
+          version="${tag#dsh-v}"
+          if [[ -z "$version" || "$version" == "$tag" ]]; then
+            echo "::error::Expected a dsh-v* tag, got '$tag'"
+            exit 1
+          fi
+          skip=false
+          if gh release view "x64-$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release x64-$version already exists; nothing to build."
+            skip=true
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected $tag; version $version; skip=$skip" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@v7.0.1
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ steps.pick.outputs.tag }}
+          path: src
+          persist-credentials: false
+      - uses: pnpm/action-setup@v5.0.0
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          package_json_file: src/package.json
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@v7.0.0
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          node-version: '24'
+      - name: Build unsigned installers
+        if: steps.pick.outputs.skip != 'true'
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          version=$(node -p "require('./apps/desktop/package.json').version")
+          pnpm run package:desktop:mac:x64 --unsigned --build-version "$version"
+      - name: Publish release asset
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifacts=src/apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts
+          dmg=$(find "$artifacts" -maxdepth 1 -name '*.dmg' -print -quit)
+          if [[ -z "$dmg" ]]; then
+            echo "::error::Packaging produced no DMG; see the packaging logs artifact"
+            exit 1
+          fi
+          shasum -a 256 "$dmg" > "$dmg.sha256"
+          gh release create "x64-${{ steps.pick.outputs.version }}" "$dmg" "$dmg.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "DSH Desktop x64 ${{ steps.pick.outputs.version }} (unsigned)" \
+            --notes "Unsigned macOS x64 build of upstream [${{ steps.pick.outputs.tag }}](https://github.com/deepseek-ai/deepseek-harness/tree/${{ steps.pick.outputs.tag }}). Built by GitHub Actions on a \`macos-15-intel\` runner; ad-hoc signed and not notarized, so Gatekeeper blocks the first launch: \`xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\"\`. The packaged-runtime smoke test may fail on a cold runner (LibreOffice conversion timeout) without affecting the DMG. Computer Use helpers are not staged because they require Developer ID and notary credentials."
+          echo "Published x64-${{ steps.pick.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload packaging diagnostics
+        if: always() && steps.pick.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: packaging-logs-${{ github.run_id }}
+          path: src/apps/desktop/.desktop-build/packaging-runs/
+          if-no-files-found: ignore
+          retention-days: 7
