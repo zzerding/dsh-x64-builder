@@ -108,17 +108,52 @@ jobs:
         with:
           node-version: '24'
       - name: Build unsigned installers
+        id: build
         if: steps.pick.outputs.skip != 'true'
+        # Packaging builds the DMG before its packaged-runtime smoke test, and that smoke test can
+        # exceed LibreOffice's internal conversion timeout on a cold runner. A failure that still
+        # leaves a DMG is therefore acceptable; one that leaves nothing is retried once and then fails.
         continue-on-error: true
         working-directory: src
         env:
           DSH_DESKTOP_PACKAGE_CACHE_DIR: ${{ runner.tool_cache }}/dsh-desktop-package-cache
           PNPM_CONFIG_STORE_DIR: ${{ runner.tool_cache }}/dsh-desktop-package-cache/workspace-pnpm-store
+          npm_config_fetch_retries: '5'
+          npm_config_fetch_retry_maxtimeout: '120000'
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          artifacts=apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts
           pnpm install --frozen-lockfile
           version=$(node -p "require('./apps/desktop/package.json').version")
-          pnpm run package:desktop:mac:x64 --unsigned --build-version "$version"
+          for attempt in 1 2; do
+            if pnpm run package:desktop:mac:x64 --unsigned --build-version "$version"; then
+              exit 0
+            fi
+            if find "$artifacts" -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null | grep -q .; then
+              echo "::warning::Packaging reported failure after building the DMG; keeping the installer"
+              exit 0
+            fi
+            journal=$(ls -td apps/desktop/.desktop-build/packaging-runs/*/ 2>/dev/null | head -1)
+            if [[ -n "$journal" && -f "${journal}events.jsonl" ]]; then
+              echo "::group::journal ${journal}"
+              tail -n 30 "${journal}events.jsonl"
+              echo "::endgroup::"
+            fi
+            if [[ "$attempt" == 1 ]]; then
+              echo "::warning::Packaging produced no DMG; retrying once"
+              sleep 30
+            fi
+          done
+          exit 1
+      - name: Require an installer
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          dmg=$(find src/apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts -maxdepth 1 -name '*.dmg' -print -quit 2>/dev/null || true)
+          if [[ -z "$dmg" ]]; then
+            echo "::error::Packaging produced no DMG"
+            exit 1
+          fi
+          echo "Installer: $dmg" >> "$GITHUB_STEP_SUMMARY"
       - name: Publish release asset
         if: steps.pick.outputs.skip != 'true'
         env:
@@ -139,6 +174,7 @@ jobs:
           echo "Published x64-${{ steps.pick.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload packaging diagnostics
         if: always() && steps.pick.outputs.skip != 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@v7.0.1
         with:
           name: packaging-logs-${{ github.run_id }}
