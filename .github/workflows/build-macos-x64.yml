@@ -166,7 +166,8 @@ jobs:
             echo "::error::Packaging produced no DMG; see the packaging logs artifact"
             exit 1
           fi
-          shasum -a 256 "$dmg" > "$dmg.sha256"
+          # The sidecar must name the basename, not the runner's build path, so `shasum -c` works after download.
+          (cd "$(dirname "$dmg")" && shasum -a 256 "$(basename "$dmg")") > "$dmg.sha256"
           gh release create "x64-${{ steps.pick.outputs.version }}" "$dmg" "$dmg.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --title "DSH Desktop x64 ${{ steps.pick.outputs.version }} (unsigned)" \
